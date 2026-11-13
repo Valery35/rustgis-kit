@@ -11,6 +11,7 @@
 //! Виды полей модуля в виды RustGIS: линии и объекты - `vectorLayer`,
 //! точки - `pointLayer`, таблица - `layer`, тела - `polygonLayer` (слой
 //! итога, высоты - из хранилища), поле - `field` или `numericField`,
+//! несколько полей - `text` с именами через запятую,
 //! число - `number`, пункт - `choice`, несколько пунктов - `text` через
 //! запятую, флажок и необязательный выход - `bool`, строка - `text`.
 //! Растра и номера канала у расширений RustGIS нет: такие инструменты
@@ -42,6 +43,9 @@ pub fn rg_kind(p: &Param) -> Option<&'static str> {
         "points" => "pointLayer",
         "table" => "layer",
         "mesh" | "meshes" => "polygonLayer",
+        // несколько полей: у RustGIS выбора нескольких полей нет, имена -
+        // текстом через запятую, разбор - tool::values
+        "field" if p.multiple => "text",
         "field" if p.numeric => "numericField",
         "field" => "field",
         "number" | "integer" => "number",
@@ -260,6 +264,37 @@ pub fn tools_section_hiding(
                 if !d.is_empty() {
                     o["default"] = json!(d);
                 }
+            } else if p.kind == "field" && p.multiple {
+                // имена полей слоя через запятую, перечень зависит от слоя
+                let tail = |l: Lang| match (l, p.numeric) {
+                    (Lang::En, false) => "Field names of the layer, comma-separated.",
+                    (Lang::En, true) => "Names of numeric fields of the layer, comma-separated.",
+                    (Lang::Ru, false) => "Имена полей слоя через запятую.",
+                    (Lang::Ru, true) => "Имена числовых полей слоя через запятую.",
+                };
+                let join = |a: &str, b: &str| {
+                    if a.is_empty() {
+                        b.to_string()
+                    } else {
+                        format!("{a} {b}")
+                    }
+                };
+                let help_en = join(&hint, tail(Lang::En));
+                let help_ru = join(&hint_ru, tail(Lang::Ru));
+                say(&help_en, &help_ru);
+                o["help"] = json!(help_en);
+                let d = match &p.default {
+                    Some(J::Array(a)) => a
+                        .iter()
+                        .filter_map(J::as_str)
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    Some(J::String(s)) => s.clone(),
+                    _ => String::new(),
+                };
+                if !d.is_empty() {
+                    o["default"] = json!(d);
+                }
             } else if p.kind == "enum" {
                 let choices: Vec<&str> = p.options.iter().map(|c| c.get(Lang::En)).collect();
                 for c in &p.options {
@@ -458,6 +493,45 @@ mod tests {
             .collect();
         assert_eq!(names, ["input"]);
         assert!(is_hidden(&[("*", "USE_M")], "any", "USE_M"));
+    }
+
+    /// Несколько полей: в окне текст через запятую, в значениях - список.
+    #[test]
+    fn multiple_fields() {
+        let cat = Catalog::parse(
+            r#"{"tools": [{"code": "1.07", "name": "group_check", "title": {"ru": "Сборка", "en": "Build"},
+            "params": [{"key": "INPUT", "kind": "lines", "label": {"ru": "Слой", "en": "Layer"}},
+                       {"key": "GROUP", "kind": "field", "multiple": true, "parent": "INPUT",
+                        "default": ["a", "b"],
+                        "label": {"ru": "Группы", "en": "Groups"},
+                        "hint": {"ru": "Поля группировки.", "en": "Grouping fields."}}]}]}"#,
+        )
+        .unwrap_or_else(|e| unreachable!("{e}"));
+        let opts = Options {
+            toolbox: "T",
+            offered: &["group_check"],
+            xy_tables: &[],
+        };
+        assert!(fits(&cat.tools[0]));
+        let (tools, ru) = tools_section(&cat, &opts);
+        let g = &tools[0]["params"][1];
+        assert_eq!(g["kind"], "text");
+        assert_eq!(g["default"], "a, b");
+        assert_eq!(
+            g["help"],
+            "Grouping fields. Field names of the layer, comma-separated."
+        );
+        assert_eq!(
+            ru["Grouping fields. Field names of the layer, comma-separated."],
+            "Поля группировки. Имена полей слоя через запятую."
+        );
+        let store = crate::store::Store::new(crate::store::temp_home("rustgis-kit-mf"));
+        let fc = json!({"type": "FeatureCollection", "features": [{"type": "Feature",
+            "properties": {"a": 1}, "geometry": {"type": "LineString", "coordinates": [[56.0, 54.7], [56.001, 54.7]]}}]});
+        let req = json!({"id": "group-check", "params": {"input": "L", "group": "a; b ,c"}, "layers": {"L": fc}});
+        let p = crate::tool::prepare(&cat, &opts, &store, &req, Lang::Ru)
+            .unwrap_or_else(|e| unreachable!("{e}"));
+        assert_eq!(p.values["GROUP"], json!(["a", "b", "c"]));
     }
 
     /// Справка в HTML (Topoliner): теги сняты, заголовок пропущен.
