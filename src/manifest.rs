@@ -554,8 +554,10 @@ fn strings(v: &J, out: &mut std::collections::HashSet<String>) {
 /// изменённый перевод заменяется на месте (с 0.1.5). Манифест - объект
 /// верхнего уровня с отступом в два пробела, как
 /// `serde_json::to_string_pretty`, переводы - по строке на ключ.
+/// Вкладку `tab`, если она уже есть в манифесте, `splice` не трогает
+/// вместе с её переводами (с 0.1.10): ею управляет [`splice_all`].
 pub fn splice(text: &str, tools: &[J], ru: &Map<String, J>) -> Result<String, String> {
-    splice_all(text, tools, None, ru)
+    splice_inner(text, tools, None, false, ru)
 }
 
 /// [`splice`] вместе со своей вкладкой ленты `tab` ([`tab_section`],
@@ -568,15 +570,29 @@ pub fn splice_all(
     tab: Option<&J>,
     ru: &Map<String, J>,
 ) -> Result<String, String> {
+    splice_inner(text, tools, tab, true, ru)
+}
+
+/// Общее у [`splice`] и [`splice_all`]: `own_tab` - вкладкой управляет
+/// крейт (заменяет, убирает, чистит переводы), иначе она не трогается.
+fn splice_inner(
+    text: &str,
+    tools: &[J],
+    tab: Option<&J>,
+    own_tab: bool,
+    ru: &Map<String, J>,
+) -> Result<String, String> {
     let mut text = text.replace("\r\n", "\n");
     let old: J = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     let mut old_tool_strings = std::collections::HashSet::new();
     strings(&old["tools"], &mut old_tool_strings);
-    strings(&old["tab"], &mut old_tool_strings);
-    // прежняя вкладка - одна строка `  "tab": {...},`
-    if let Some(s) = text.find("\n  \"tab\": ") {
-        let e = text[s + 1..].find('\n').map_or(text.len(), |e| s + 1 + e);
-        text.replace_range(s..e, "");
+    if own_tab {
+        strings(&old["tab"], &mut old_tool_strings);
+        // прежняя вкладка - одна строка `  "tab": {...},`
+        if let Some(s) = text.find("\n  \"tab\": ") {
+            let e = text[s + 1..].find('\n').map_or(text.len(), |e| s + 1 + e);
+            text.replace_range(s..e, "");
+        }
     }
     if let Some(s) = text.find("\n  \"tools\": [") {
         let e = text[s..]
@@ -600,7 +616,7 @@ pub fn splice_all(
     let mut other = std::collections::HashSet::new();
     if let Some(o) = m.as_object() {
         for (k, v) in o {
-            if k != "tools" && k != "tab" && k != "i18n" {
+            if k != "tools" && k != "i18n" && !(own_tab && k == "tab") {
                 strings(v, &mut other);
             }
         }
@@ -846,6 +862,11 @@ mod tests {
         assert!(m.get("tab").is_none());
         assert!(m["i18n"]["ru"].get("Window").is_none(), "{gone}");
         assert_eq!(m["i18n"]["ru"]["x"], "y");
+        // splice без вкладки чужую вкладку и переводы её меню не трогает
+        let kept = splice(&one, &tools, &plain).unwrap_or_default();
+        let m: J = serde_json::from_str(&kept).unwrap_or(J::Null);
+        assert_eq!(m["tab"], tab);
+        assert_eq!(m["i18n"]["ru"]["Window"], "Окно");
     }
 
     /// Справка в HTML (Topoliner): теги сняты, заголовок пропущен.
