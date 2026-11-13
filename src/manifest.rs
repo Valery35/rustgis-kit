@@ -54,12 +54,110 @@ pub fn rg_kind(p: &Param) -> Option<&'static str> {
     })
 }
 
-/// Первое предложение подсказки: строка `summary` RustGIS.
-pub fn summary(help: &str) -> &str {
-    let line = help.lines().next().unwrap_or("").trim();
+/// Текст без HTML: `<br>`, `<p>`, `<li>` и заголовки - переводы строк,
+/// прочие теги убираются, сущности (`&amp;`, `&nbsp;`, `&#39;`) -
+/// знаками, пробелы внутри строки схлопываются. Справки модулей бывают
+/// в HTML (Topoliner), окно RustGIS показывает текст.
+pub fn plain_text(s: &str) -> String {
+    if !s.contains('<') && !s.contains('&') {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut rest = s;
+    while let Some(i) = rest.find('<') {
+        out.push_str(&rest[..i]);
+        let Some(j) = rest[i..].find('>') else {
+            out.push_str(&rest[i..]);
+            rest = "";
+            break;
+        };
+        let tag = rest[i + 1..i + j]
+            .trim_start_matches('/')
+            .split(|c: char| c.is_whitespace() || c == '/')
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if matches!(
+            tag.as_str(),
+            "br" | "p"
+                | "div"
+                | "li"
+                | "ul"
+                | "ol"
+                | "tr"
+                | "h1"
+                | "h2"
+                | "h3"
+                | "h4"
+                | "h5"
+                | "h6"
+        ) {
+            out.push('\n');
+        }
+        rest = &rest[i + j + 1..];
+    }
+    out.push_str(rest);
+    let mut text = String::new();
+    let mut rest = out.as_str();
+    while let Some(i) = rest.find('&') {
+        text.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let end = tail.find(';').filter(|&e| e <= 10);
+        let ch = end.and_then(|e| match &tail[1..e] {
+            "amp" => Some('&'),
+            "lt" => Some('<'),
+            "gt" => Some('>'),
+            "quot" => Some('"'),
+            "apos" => Some('\''),
+            "nbsp" => Some(' '),
+            n if n.starts_with("#x") || n.starts_with("#X") => u32::from_str_radix(&n[2..], 16)
+                .ok()
+                .and_then(char::from_u32),
+            n if n.starts_with('#') => n[1..].parse().ok().and_then(char::from_u32),
+            _ => None,
+        });
+        match (ch, end) {
+            (Some(c), Some(e)) => {
+                text.push(c);
+                rest = &tail[e + 1..];
+            }
+            _ => {
+                text.push('&');
+                rest = &tail[1..];
+            }
+        }
+    }
+    text.push_str(rest);
+    let lines: Vec<String> = text
+        .lines()
+        .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" "))
+        .collect();
+    // пустые строки подряд - одна, по краям - ни одной
+    let mut kept: Vec<String> = Vec::new();
+    for l in lines {
+        if !(l.is_empty() && kept.last().is_none_or(String::is_empty)) {
+            kept.push(l);
+        }
+    }
+    while kept.last().is_some_and(String::is_empty) {
+        kept.pop();
+    }
+    kept.join("\n")
+}
+
+/// Первое предложение справки: строка `summary` RustGIS. HTML снимается,
+/// строки-заголовки, равные одному из `titles` (название инструмента
+/// с кодом и без), пропускаются.
+pub fn summary(help: &str, titles: &[&str]) -> String {
+    let text = plain_text(help);
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !titles.iter().any(|t| t.trim() == *l))
+        .unwrap_or("");
     match line.find(". ") {
-        Some(i) => &line[..=i],
-        None => line,
+        Some(i) => line[..=i].to_string(),
+        None => line.to_string(),
     }
 }
 
@@ -87,21 +185,24 @@ pub fn tools_section(catalog: &Catalog, opts: &Options) -> (Vec<J>, Map<String, 
         };
         let title = t.display_name(Lang::En);
         say(&title, &t.display_name(Lang::Ru));
-        let sum = summary(t.help.get(Lang::En));
-        say(sum, summary(t.help.get(Lang::Ru)));
+        let titles = |l: Lang| [t.display_name(l), t.title.get(l).to_string()];
+        let (te, tr) = (titles(Lang::En), titles(Lang::Ru));
+        let sum = summary(t.help.get(Lang::En), &[&te[0], &te[1]]);
+        say(&sum, &summary(t.help.get(Lang::Ru), &[&tr[0], &tr[1]]));
         let mut params = Vec::new();
         for p in &t.params {
             let Some(kind) = rg_kind(p) else { continue };
-            let label = p.label.get(Lang::En);
-            say(label, p.label.get(Lang::Ru));
+            let label = plain_text(p.label.get(Lang::En));
+            say(&label, &plain_text(p.label.get(Lang::Ru)));
             let mut o = json!({"name": p.rg_name(), "label": label, "kind": kind});
             if p.is_layer() && !p.optional {
                 o["required"] = json!(true);
             }
-            let hint = p.hint.get(Lang::En);
+            let hint = plain_text(p.hint.get(Lang::En));
+            let hint_ru = plain_text(p.hint.get(Lang::Ru));
             if !hint.is_empty() {
                 o["help"] = json!(hint);
-                say(hint, p.hint.get(Lang::Ru));
+                say(&hint, &hint_ru);
             }
             if p.kind == "enum" && p.multiple {
                 // пункты через запятую, их перечень - в подсказке
@@ -127,11 +228,7 @@ pub fn tools_section(catalog: &Catalog, opts: &Options) -> (Vec<J>, Map<String, 
                         .join(", ")
                 };
                 let help_en = format!("{} Comma-separated, from {}.", hint, all(Lang::En));
-                let help_ru = format!(
-                    "{} Через запятую, из списка {}.",
-                    p.hint.get(Lang::Ru),
-                    all(Lang::Ru)
-                );
+                let help_ru = format!("{} Через запятую, из списка {}.", hint_ru, all(Lang::Ru));
                 say(&help_en, &help_ru);
                 o["help"] = json!(help_en);
                 let d = pick(Lang::En);
@@ -243,5 +340,28 @@ mod tests {
         // повторная вставка заменяет раздел, а не дублирует
         let again = splice(&out, &tools, &ru).unwrap_or_default();
         assert_eq!(again.matches("\"tools\"").count(), 1);
+    }
+
+    /// Справка в HTML (Topoliner): теги сняты, заголовок пропущен.
+    #[test]
+    fn html_help() {
+        let help = "<b>1.01 Polygon topology check</b><br><br>The layer is not modified. \
+                    Errors go to a new layer.<ul><li>gaps &amp; overlaps</li></ul>";
+        assert_eq!(
+            summary(
+                help,
+                &["1.01 Polygon topology check", "Polygon topology check"]
+            ),
+            "The layer is not modified."
+        );
+        assert_eq!(
+            plain_text(help),
+            "1.01 Polygon topology check\n\nThe layer is not modified. Errors go to a new layer.\n\ngaps & overlaps"
+        );
+        assert_eq!(
+            plain_text("a &lt; b &#8212; c&nbsp;d, 5 & 6"),
+            "a < b \u{2014} c d, 5 & 6"
+        );
+        assert_eq!(plain_text("Plain. Text."), "Plain. Text.");
     }
 }

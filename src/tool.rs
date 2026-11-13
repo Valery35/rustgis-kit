@@ -17,7 +17,8 @@
 //! - градусы - в метры зоны UTM по середине входа ([`crate::geo`]);
 //! - слой-итог (тела, линии, точки с высотой) берёт высоты из хранилища
 //!   ([`crate::store`]), поле-тело без итога - отказ с объяснением;
-//! - линии и объекты - `[{"id", "parts", "attrs"}]`, точки и таблица -
+//! - линии и объекты - `[{"id", "parts", "attrs"}]`, у полигона ещё
+//!   `polygons` - части с внешним кольцом и дырами, точки и таблица -
 //!   `[{"id", "xyz", "attrs"}]`, тело - `{"verts", "faces"}`, слой тел -
 //!   `[{"id", "attrs", "verts", "faces"}]`, сведения о слое - `"@КЛЮЧ"`;
 //! - пункт списка - номер, несколько пунктов - список номеров, число,
@@ -156,7 +157,21 @@ pub fn layer_value(p: &Param, fc: &J, utm: &Utm) -> J {
                         .iter()
                         .map(|q| q.iter().map(|&pt| xyz(pt)).collect())
                         .collect();
-                    json!({"id": id, "attrs": f["properties"], "parts": parts})
+                    let mut o = json!({"id": id, "attrs": f["properties"], "parts": parts});
+                    // полигон: части и дыры как в слое, внешнее кольцо первым
+                    let polys = geom::polygons_m(&f["geometry"], utm);
+                    if !polys.is_empty() {
+                        o["polygons"] = json!(
+                            polys
+                                .iter()
+                                .map(|rings| rings
+                                    .iter()
+                                    .map(|r| r.iter().map(|&pt| xyz(pt)).collect::<Vec<_>>())
+                                    .collect::<Vec<_>>())
+                                .collect::<Vec<_>>()
+                        );
+                    }
+                    o
                 }
             })
             .collect(),
@@ -467,7 +482,7 @@ pub fn finish(
             });
         // свой итог - только если у него есть высота: точки и линии без Z
         // слой RustGIS держит и так
-        let own_z = matches!(kind, "mesh" | "line" | "point")
+        let own_z = matches!(kind, "mesh" | "line" | "point" | "polygon")
             && feats.iter().any(|f| {
                 let g = &f["geometry"];
                 geom::z_range(g).is_some()

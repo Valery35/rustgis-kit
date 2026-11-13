@@ -9,6 +9,8 @@
 //! - тело - `{"verts": [[x, y, z]], "faces": [[a, b, c]]}`;
 //! - линия - `{"points": [[x, y, z]]}`;
 //! - мультилиния (линия с разрывами) - `{"parts": [[[x, y, z]]]}`;
+//! - полигон - `{"rings": [[[x, y, z]]]}`, первое кольцо внешнее, дальше
+//!   дыры, несколько полигонов - `{"polygons": [[[[x, y, z]]]]}`;
 //! - точка - `{"xyz": [x, y, z]}`;
 //! - объект источника - `{"source": id}`;
 //! - строка таблицы - `null`;
@@ -232,6 +234,61 @@ fn mparts(g: &J) -> Vec<Vec<[f64; 3]>> {
         .collect()
 }
 
+/// Кольцо - замкнутое: последняя точка равна первой. Кольцо короче трёх
+/// разных точек - None.
+fn closed(mut ring: Vec<[f64; 3]>) -> Option<Vec<[f64; 3]>> {
+    let (first, last) = (*ring.first()?, *ring.last()?);
+    if first[0] != last[0] || first[1] != last[1] {
+        ring.push(first);
+    }
+    (ring.len() >= 4).then_some(ring)
+}
+
+/// Полигоны модуля: `{"rings": [кольца]}` - один полигон (внешнее кольцо,
+/// потом дыры), `{"polygons": [[кольца]]}` - несколько. Полигон без
+/// внешнего кольца - пропуск, порченая дыра - пропуск.
+fn mpolygons(g: &J) -> Vec<Vec<Vec<[f64; 3]>>> {
+    let poly = |v: &J| -> Option<Vec<Vec<[f64; 3]>>> {
+        let rings: Vec<Vec<[f64; 3]>> = v.as_array()?.iter().map(mpoints).collect();
+        let mut it = rings.into_iter();
+        let outer = closed(it.next()?)?;
+        Some(
+            std::iter::once(outer)
+                .chain(it.filter_map(closed))
+                .collect(),
+        )
+    };
+    if g.get("rings").is_some() {
+        return poly(&g["rings"]).into_iter().collect();
+    }
+    g["polygons"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(poly)
+        .collect()
+}
+
+/// Части и дыры полигонов GeoJSON в метрах зоны: полигон - внешнее
+/// кольцо и дыры, как в слое. Не полигон - пусто.
+pub fn polygons_m(g: &J, utm: &Utm) -> Vec<Vec<Vec<[f64; 3]>>> {
+    let counts: Vec<usize> = match g["type"].as_str() {
+        Some("Polygon") => vec![g["coordinates"].as_array().map_or(0, Vec::len)],
+        Some("MultiPolygon") => g["coordinates"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .map(|p| p.as_array().map_or(0, Vec::len))
+            .collect(),
+        _ => return Vec::new(),
+    };
+    let mut flat = parts_m(g, utm).into_iter();
+    counts
+        .into_iter()
+        .map(|n| flat.by_ref().take(n).collect())
+        .collect()
+}
+
 /// Треугольники тела модуля: тройки вершин. Порченый номер - пропуск.
 fn triangles(g: &J) -> Vec<[[f64; 3]; 3]> {
     let verts = mpoints(&g["verts"]);
@@ -257,6 +314,8 @@ pub fn z_range(g: &J) -> Option<(f64, f64)> {
         mpoints(&g["points"])
     } else if g.get("parts").is_some() {
         mparts(g).concat()
+    } else if g.get("rings").is_some() || g.get("polygons").is_some() {
+        mpolygons(g).concat().concat()
     } else {
         return None;
     };
@@ -303,6 +362,18 @@ pub fn plan(g: &J, frame: &Frame, sources: &HashMap<i64, J>) -> J {
             .collect();
         return json!({"type": "MultiLineString", "coordinates": lines});
     }
+    if g.get("rings").is_some() || g.get("polygons").is_some() {
+        let polys: Vec<Vec<Vec<J>>> = mpolygons(g)
+            .iter()
+            .map(|rings| {
+                rings
+                    .iter()
+                    .map(|r| r.iter().map(|p| frame.coord(p)).collect())
+                    .collect()
+            })
+            .collect();
+        return polygon_json(polys);
+    }
     if let Some(p) = mpoint(&g["xyz"]) {
         return json!({"type": "Point", "coordinates": frame.coord(&p)});
     }
@@ -310,6 +381,17 @@ pub fn plan(g: &J, frame: &Frame, sources: &HashMap<i64, J>) -> J {
         return strip_z(&sources.get(&id).cloned().unwrap_or(J::Null));
     }
     J::Null
+}
+
+/// Полигоны GeoJSON: один - Polygon, несколько - MultiPolygon, ни одного -
+/// пустой MultiPolygon.
+fn polygon_json(mut polys: Vec<Vec<Vec<J>>>) -> J {
+    if polys.len() == 1 {
+        let p = polys.remove(0);
+        json!({"type": "Polygon", "coordinates": p})
+    } else {
+        json!({"type": "MultiPolygon", "coordinates": polys})
+    }
 }
 
 /// Геометрия итога с высотой в градусах зоны `utm` с метрами рядом:
@@ -369,6 +451,17 @@ pub fn solid(g: &J, utm: &Utm, sources: &HashMap<i64, J>) -> J {
             json!(m),
             utm,
         );
+    }
+    if g.get("rings").is_some() || g.get("polygons").is_some() {
+        let ps = mpolygons(g);
+        let map = |f: &dyn Fn(&[f64; 3]) -> J| -> Vec<Vec<Vec<J>>> {
+            ps.iter()
+                .map(|rings| rings.iter().map(|r| r.iter().map(f).collect()).collect())
+                .collect()
+        };
+        let deg = polygon_json(map(&|q| lonlat_z(utm, q)));
+        let m = polygon_json(map(&metre));
+        return with_metres(deg, m["coordinates"].clone(), utm);
     }
     if let Some(p) = mpoint(&g["xyz"]) {
         return with_metres(
@@ -466,5 +559,38 @@ mod tests {
         assert!(back[1][1][2].is_nan());
         let native = plan(&g, &Frame::Native("EPSG:28410".into()), &HashMap::new());
         assert_eq!(native["coordinates"][1][0], json!([e + 20.0, n]));
+    }
+
+    /// Полигон с дырой и многочастный: план - Polygon и MultiPolygon,
+    /// кольца замкнуты, на входе части и дыры те же.
+    #[test]
+    fn polygons_with_holes() {
+        let utm = Utm::at(56.0, 54.7);
+        let [e, n] = utm.forward(56.0, 54.7).map(f64::round);
+        let sq = |x: f64, y: f64, s: f64, z: J| {
+            json!([[x, y, z], [x + s, y, z], [x + s, y + s, z], [x, y + s, z]])
+        };
+        let one = json!({"rings": [sq(e, n, 100.0, json!(5.0)), sq(e + 10.0, n + 10.0, 20.0, json!(5.0)),
+                                   [[e, n, 0.0], [e + 1.0, n, 0.0]]]});
+        assert_eq!(z_range(&one), Some((5.0, 5.0)));
+        let p = plan(&one, &Frame::Utm(utm), &HashMap::new());
+        assert_eq!(p["type"], "Polygon");
+        // порченая дыра выпала, кольца замкнуты
+        assert_eq!(p["coordinates"].as_array().map(Vec::len), Some(2));
+        assert_eq!(p["coordinates"][1][0], p["coordinates"][1][4]);
+        let s = solid(&one, &utm, &HashMap::new());
+        assert_eq!(s["coordinates"][0][2][2], 5.0);
+        let back = polygons_m(&s, &utm);
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].len(), 2);
+        assert_eq!(back[0][1][0], [e + 10.0, n + 10.0, 5.0]);
+        let two =
+            json!({"polygons": [[sq(e, n, 10.0, J::Null)], [sq(e + 50.0, n, 10.0, J::Null)]]});
+        let p = plan(&two, &Frame::Utm(utm), &HashMap::new());
+        assert_eq!(p["type"], "MultiPolygon");
+        assert_eq!(z_range(&two), None);
+        let back = polygons_m(&p, &utm);
+        assert_eq!((back.len(), back[1].len()), (2, 1));
+        assert!((back[1][0][0][0] - (e + 50.0)).abs() < 1e-6);
     }
 }
