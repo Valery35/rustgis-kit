@@ -8,6 +8,7 @@
 //!
 //! - тело - `{"verts": [[x, y, z]], "faces": [[a, b, c]]}`;
 //! - линия - `{"points": [[x, y, z]]}`;
+//! - мультилиния (линия с разрывами) - `{"parts": [[[x, y, z]]]}`;
 //! - точка - `{"xyz": [x, y, z]}`;
 //! - объект источника - `{"source": id}`;
 //! - строка таблицы - `null`;
@@ -219,6 +220,18 @@ fn mpoints(v: &J) -> Vec<[f64; 3]> {
         .collect()
 }
 
+/// Части мультилинии модуля `{"parts": [[[x, y, z]]]}`. Часть короче
+/// двух точек - пропуск.
+fn mparts(g: &J) -> Vec<Vec<[f64; 3]>> {
+    g["parts"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(mpoints)
+        .filter(|p| p.len() >= 2)
+        .collect()
+}
+
 /// Треугольники тела модуля: тройки вершин. Порченый номер - пропуск.
 fn triangles(g: &J) -> Vec<[[f64; 3]; 3]> {
     let verts = mpoints(&g["verts"]);
@@ -242,6 +255,8 @@ pub fn z_range(g: &J) -> Option<(f64, f64)> {
         mpoints(&g["verts"])
     } else if g.get("points").is_some() {
         mpoints(&g["points"])
+    } else if g.get("parts").is_some() {
+        mparts(g).concat()
     } else {
         return None;
     };
@@ -280,6 +295,13 @@ pub fn plan(g: &J, frame: &Frame, sources: &HashMap<i64, J>) -> J {
             .map(|p| frame.coord(p))
             .collect();
         return json!({"type": "LineString", "coordinates": pts});
+    }
+    if g.get("parts").is_some() {
+        let lines: Vec<Vec<J>> = mparts(g)
+            .iter()
+            .map(|part| part.iter().map(|p| frame.coord(p)).collect())
+            .collect();
+        return json!({"type": "MultiLineString", "coordinates": lines});
     }
     if let Some(p) = mpoint(&g["xyz"]) {
         return json!({"type": "Point", "coordinates": frame.coord(&p)});
@@ -329,6 +351,22 @@ pub fn solid(g: &J, utm: &Utm, sources: &HashMap<i64, J>) -> J {
         return with_metres(
             json!({"type": "LineString", "coordinates": p.iter().map(|q| lonlat_z(utm, q)).collect::<Vec<_>>()}),
             json!(p.iter().map(metre).collect::<Vec<_>>()),
+            utm,
+        );
+    }
+    if g.get("parts").is_some() {
+        let ps = mparts(g);
+        let deg: Vec<Vec<J>> = ps
+            .iter()
+            .map(|part| part.iter().map(|q| lonlat_z(utm, q)).collect())
+            .collect();
+        let m: Vec<Vec<J>> = ps
+            .iter()
+            .map(|part| part.iter().map(metre).collect())
+            .collect();
+        return with_metres(
+            json!({"type": "MultiLineString", "coordinates": deg}),
+            json!(m),
             utm,
         );
     }
@@ -403,5 +441,30 @@ mod tests {
         assert_eq!(b["verts"][0], json!([e, n, -300.0]));
         let flat = strip_z(&s);
         assert!(flat.get("m").is_none() && !has_z(&flat));
+    }
+
+    /// Линия с разрывом: план - MultiLineString без высот, 3D - с высотами
+    /// и метрами, части из одной точки отброшены, обратно в метры - те же.
+    #[test]
+    fn multiline_with_a_gap() {
+        let utm = Utm::at(56.0, 54.7);
+        let [e, n] = utm.forward(56.0, 54.7).map(f64::round);
+        let g = json!({"parts": [[[e, n, -5.0], [e + 10.0, n, -6.0]],
+                                 [[e + 20.0, n, -7.0], [e + 30.0, n, null]],
+                                 [[e + 40.0, n, 1.0]]]});
+        assert_eq!(z_range(&g), Some((-7.0, -5.0)));
+        let p = plan(&g, &Frame::Utm(utm), &HashMap::new());
+        assert_eq!(p["type"], "MultiLineString");
+        assert_eq!(p["coordinates"].as_array().map(Vec::len), Some(2));
+        assert!(!has_z(&p));
+        let s = solid(&g, &utm, &HashMap::new());
+        assert_eq!(s["type"], "MultiLineString");
+        assert_eq!(s["coordinates"][0][1][2], -6.0);
+        let back = parts_m(&s, &utm);
+        assert_eq!(back.len(), 2);
+        assert_eq!(back[1][0], [e + 20.0, n, -7.0]);
+        assert!(back[1][1][2].is_nan());
+        let native = plan(&g, &Frame::Native("EPSG:28410".into()), &HashMap::new());
+        assert_eq!(native["coordinates"][1][0], json!([e + 20.0, n]));
     }
 }
