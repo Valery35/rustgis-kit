@@ -295,13 +295,30 @@ pub fn tools_section_hiding(
     (tools, ru)
 }
 
-/// Вставить раздел `tools` и новые русские строки в текст манифеста, не
-/// трогая порядок и вид остального: раздел - перед `"i18n"`, по
-/// инструменту на строку, переводы - в начало `"ru"`. Прежний раздел
-/// `tools` заменяется. Манифест - объект верхнего уровня с отступом
-/// в два пробела, как `serde_json::to_string_pretty`.
+/// Все строки значения JSON, вглубь.
+fn strings(v: &J, out: &mut std::collections::HashSet<String>) {
+    match v {
+        J::String(s) => {
+            out.insert(s.clone());
+        }
+        J::Array(a) => a.iter().for_each(|x| strings(x, out)),
+        J::Object(o) => o.values().for_each(|x| strings(x, out)),
+        _ => {}
+    }
+}
+
+/// Вставить раздел `tools` и русские строки в текст манифеста, не трогая
+/// порядок и вид остального: раздел - перед `"i18n"`, по инструменту на
+/// строку, новые переводы - в начало `"ru"`. Прежний раздел `tools`
+/// заменяется. Перевод, чей ключ был только в прежнем разделе, удаляется,
+/// изменённый перевод заменяется на месте (с 0.1.5). Манифест - объект
+/// верхнего уровня с отступом в два пробела, как
+/// `serde_json::to_string_pretty`, переводы - по строке на ключ.
 pub fn splice(text: &str, tools: &[J], ru: &Map<String, J>) -> Result<String, String> {
     let mut text = text.replace("\r\n", "\n");
+    let old: J = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+    let mut old_tool_strings = std::collections::HashSet::new();
+    strings(&old["tools"], &mut old_tool_strings);
     if let Some(s) = text.find("\n  \"tools\": [") {
         let e = text[s..]
             .find("\n  ],")
@@ -316,15 +333,57 @@ pub fn splice(text: &str, tools: &[J], ru: &Map<String, J>) -> Result<String, St
         .ok_or("plugin.json: no i18n section")?;
     text.insert_str(at, &block);
     let m: J = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-    let mut add = String::new();
-    for (k, v) in ru {
-        if m["i18n"]["ru"].get(k).is_none() {
-            add.push_str(&format!("      {}: {v},\n", json!(k)));
+    // строки манифеста вне tools и i18n (описание, команды): их переводы
+    // не трогаются
+    let mut other = std::collections::HashSet::new();
+    if let Some(o) = m.as_object() {
+        for (k, v) in o {
+            if k != "tools" && k != "i18n" {
+                strings(v, &mut other);
+            }
         }
     }
     let key = "\"ru\": {\n";
-    let at = text.find(key).ok_or("plugin.json: no i18n.ru section")? + key.len();
-    text.insert_str(at, &add);
+    let start = text.find(key).ok_or("plugin.json: no i18n.ru section")? + key.len();
+    // пустой ru - закрывающая скобка сразу
+    let empty = text[start..].starts_with("    }");
+    let len = if empty {
+        0
+    } else {
+        text[start..]
+            .find("\n    }")
+            .ok_or("plugin.json: i18n.ru without an end")?
+    };
+    let mut entries: Vec<String> = ru
+        .iter()
+        .filter(|(k, _)| m["i18n"]["ru"].get(*k).is_none())
+        .map(|(k, v)| format!("      {}: {v}", json!(k)))
+        .collect();
+    for line in text[start..start + len].lines() {
+        let body = line.trim().trim_end_matches(',');
+        let parsed: Option<(String, J)> =
+            serde_json::from_str::<Map<String, J>>(&format!("{{{body}}}"))
+                .ok()
+                .and_then(|o| o.into_iter().next());
+        let Some((k, v)) = parsed else {
+            // не строка перевода - как есть
+            if !body.is_empty() {
+                entries.push(line.trim_end_matches(',').to_string());
+            }
+            continue;
+        };
+        match ru.get(&k) {
+            Some(new) if *new != v => entries.push(format!("      {}: {new}", json!(k))),
+            Some(_) => entries.push(line.trim_end_matches(',').to_string()),
+            None if old_tool_strings.contains(&k) && !other.contains(&k) => {}
+            None => entries.push(line.trim_end_matches(',').to_string()),
+        }
+    }
+    let mut block = entries.join(",\n");
+    if empty && !block.is_empty() {
+        block.push('\n');
+    }
+    text.replace_range(start..start + len, &block);
     serde_json::from_str::<J>(&text).map_err(|e| e.to_string())?;
     Ok(text)
 }
@@ -365,6 +424,26 @@ mod tests {
         // повторная вставка заменяет раздел, а не дублирует
         let again = splice(&out, &tools, &ru).unwrap_or_default();
         assert_eq!(again.matches("\"tools\"").count(), 1);
+        assert_eq!(again, out);
+        // справка сменилась: старый перевод уходит, изменённый - заменяется,
+        // чужие строки остаются
+        let mut ru2 = ru.clone();
+        ru2.remove("Does the job.");
+        ru2.insert("Does it better.".into(), json!("Делает лучше."));
+        ru2.insert("Lines".into(), json!("Линии слоя"));
+        let mut tools2 = tools.clone();
+        tools2[0]["summary"] = json!("Does it better.");
+        let third = splice(&out, &tools2, &ru2).unwrap_or_default();
+        let m3: J = serde_json::from_str(&third).unwrap_or(J::Null);
+        assert!(m3["i18n"]["ru"].get("Does the job.").is_none(), "{third}");
+        assert_eq!(m3["i18n"]["ru"]["Does it better."], "Делает лучше.");
+        assert_eq!(m3["i18n"]["ru"]["Lines"], "Линии слоя");
+        assert_eq!(m3["i18n"]["ru"]["x"], "y");
+        // пустой ru
+        let bare = "{\n  \"id\": \"b\",\n  \"i18n\": {\n    \"ru\": {\n    }\n  }\n}\n";
+        let b: J =
+            serde_json::from_str(&splice(bare, &tools, &ru).unwrap_or_default()).unwrap_or(J::Null);
+        assert_eq!(b["i18n"]["ru"]["Lines"], "Линии");
         // скрытое поле с умолчанием уходит из окна, обязательный слой - нет
         let (hid, _) = tools_section_hiding(
             &cat,
