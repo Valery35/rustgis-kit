@@ -329,6 +329,212 @@ pub fn tools_section_hiding(
     (tools, ru)
 }
 
+/// Подпись на двух языках для вкладки, групп и меню.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Label {
+    pub en: &'static str,
+    pub ru: &'static str,
+}
+
+/// Размер кнопок: крупные во всю высоту ленты или мелкие по три в столбец.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Layout {
+    Large,
+    Small,
+}
+
+impl Layout {
+    fn name(self) -> &'static str {
+        match self {
+            Layout::Large => "large",
+            Layout::Small => "small",
+        }
+    }
+}
+
+/// Кнопка вкладки.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Item {
+    /// Команда из `commands` манифеста по id.
+    Command(&'static str),
+    /// Инструмент по имени Processing (`sweep_body`) - `tool:<id RustGIS>`.
+    Tool(&'static str),
+    /// Панель расширения.
+    Panel,
+    /// Выпадающее меню.
+    Menu(&'static Menu),
+}
+
+/// Выпадающее меню: значок - имя значка RustGIS (`polygon_layer`,
+/// `table`...), полный список - `ALL` в `crates/ui-egui/src/icons.rs`
+/// RustGIS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Menu {
+    pub label: Label,
+    pub icon: Option<&'static str>,
+    pub help: Option<Label>,
+    pub layout: Option<Layout>,
+    pub items: &'static [Item],
+}
+
+/// Группа вкладки.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Group {
+    pub label: Label,
+    pub layout: Layout,
+    pub items: &'static [Item],
+}
+
+/// Своя вкладка ленты RustGIS (docs/plugins.md, «A tab of its own»):
+/// вкладка с 0.1.0, меню и мелкие кнопки - с RustGIS 0.5.0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Tab {
+    pub label: Label,
+    pub groups: &'static [Group],
+}
+
+/// Имена вкладок RustGIS, которые занимать нельзя (и прежние имена).
+const RESERVED_TABS: &[&str] = &[
+    "Home", "Map", "Insert", "Data", "Style", "Edit", "Analyze", "View", "Imagery", "Share",
+    "Publish", "Plugins", "Settings", "Labeling", "Help", "Layout",
+];
+
+/// Сборка вкладки: каталог, инструменты продукта, команды, счёт кнопок
+/// и русские строки.
+struct TabBuild<'a> {
+    catalog: &'a Catalog,
+    opts: &'a Options,
+    commands: &'a [&'a str],
+    count: usize,
+    ru: Map<String, J>,
+}
+
+impl TabBuild<'_> {
+    fn say(&mut self, l: &Label) {
+        if !l.en.is_empty() && l.en != l.ru {
+            self.ru.insert(l.en.to_string(), json!(l.ru));
+        }
+    }
+
+    /// Подпись: одна строка от 1 до 32 знаков.
+    fn label(l: &Label, what: &str) -> Result<J, String> {
+        let n = l.en.chars().count();
+        if !(1..=32).contains(&n) || l.en.contains('\n') {
+            return Err(format!("{what} '{}': one line of 1 to 32 characters", l.en));
+        }
+        Ok(json!(l.en))
+    }
+
+    fn item(&mut self, it: &Item, depth: usize) -> Result<J, String> {
+        self.count += 1;
+        Ok(match it {
+            Item::Command(id) => {
+                if !self.commands.contains(id) {
+                    return Err(format!("tab: no command '{id}'"));
+                }
+                json!(id)
+            }
+            Item::Tool(name) => {
+                let t = self
+                    .catalog
+                    .tool(name)
+                    .filter(|_| self.opts.offered.contains(name))
+                    .ok_or_else(|| format!("tab: tool '{name}' is not offered"))?;
+                json!(format!("tool:{}", t.rg_id()))
+            }
+            Item::Panel => json!("panel"),
+            Item::Menu(m) => {
+                if depth > 4 {
+                    return Err(format!(
+                        "tab: menu '{}' nests deeper than 4 levels",
+                        m.label.en
+                    ));
+                }
+                if !(1..=32).contains(&m.items.len()) {
+                    return Err(format!("tab: menu '{}' needs 1 to 32 items", m.label.en));
+                }
+                self.say(&m.label);
+                let mut o = json!({"menu": Self::label(&m.label, "menu")?});
+                if let Some(icon) = m.icon {
+                    o["icon"] = json!(icon);
+                }
+                if let Some(h) = &m.help {
+                    self.say(h);
+                    o["help"] = json!(h.en);
+                }
+                if let Some(l) = m.layout {
+                    o["layout"] = json!(l.name());
+                }
+                let items = m
+                    .items
+                    .iter()
+                    .map(|x| self.item(x, depth + 1))
+                    .collect::<Result<Vec<_>, _>>()?;
+                o["items"] = json!(items);
+                o
+            }
+        })
+    }
+}
+
+/// Раздел `tab` манифеста и русские строки к нему. `commands` - id команд
+/// манифеста. Ошибка - текст о том, что нарушает правила RustGIS: число
+/// групп и кнопок, глубина меню, длина подписи, занятое имя вкладки,
+/// инструмент вне `opts.offered`, чужая команда.
+pub fn tab_section(
+    tab: &Tab,
+    catalog: &Catalog,
+    opts: &Options,
+    commands: &[&str],
+) -> Result<(J, Map<String, J>), String> {
+    if RESERVED_TABS
+        .iter()
+        .any(|r| r.eq_ignore_ascii_case(tab.label.en))
+    {
+        return Err(format!("tab '{}': the name of a RustGIS tab", tab.label.en));
+    }
+    if !(1..=8).contains(&tab.groups.len()) {
+        return Err("tab: 1 to 8 groups".into());
+    }
+    let mut b = TabBuild {
+        catalog,
+        opts,
+        commands,
+        count: 0,
+        ru: Map::new(),
+    };
+    b.say(&tab.label);
+    let mut groups = Vec::new();
+    for g in tab.groups {
+        let max = match g.layout {
+            Layout::Large => 16,
+            Layout::Small => 48,
+        };
+        if !(1..=max).contains(&g.items.len()) {
+            return Err(format!(
+                "tab: group '{}' needs 1 to {max} items",
+                g.label.en
+            ));
+        }
+        b.say(&g.label);
+        let items = g
+            .items
+            .iter()
+            .map(|x| b.item(x, 1))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut o = json!({"label": TabBuild::label(&g.label, "group")?, "items": items});
+        if g.layout == Layout::Small {
+            o["layout"] = json!("small");
+        }
+        groups.push(o);
+    }
+    if b.count > 16_384 {
+        return Err("tab: more than 16384 items".into());
+    }
+    let out = json!({"label": TabBuild::label(&tab.label, "tab")?, "groups": groups});
+    Ok((out, b.ru))
+}
+
 /// Все строки значения JSON, вглубь.
 fn strings(v: &J, out: &mut std::collections::HashSet<String>) {
     match v {
@@ -349,10 +555,29 @@ fn strings(v: &J, out: &mut std::collections::HashSet<String>) {
 /// верхнего уровня с отступом в два пробела, как
 /// `serde_json::to_string_pretty`, переводы - по строке на ключ.
 pub fn splice(text: &str, tools: &[J], ru: &Map<String, J>) -> Result<String, String> {
+    splice_all(text, tools, None, ru)
+}
+
+/// [`splice`] вместе со своей вкладкой ленты `tab` ([`tab_section`],
+/// с 0.1.9): вкладка - одной строкой перед `"tools"`, прежняя заменяется,
+/// None - прежняя убирается. Переводы прежней вкладки чистятся так же,
+/// как переводы прежнего раздела `tools`.
+pub fn splice_all(
+    text: &str,
+    tools: &[J],
+    tab: Option<&J>,
+    ru: &Map<String, J>,
+) -> Result<String, String> {
     let mut text = text.replace("\r\n", "\n");
     let old: J = serde_json::from_str(&text).map_err(|e| e.to_string())?;
     let mut old_tool_strings = std::collections::HashSet::new();
     strings(&old["tools"], &mut old_tool_strings);
+    strings(&old["tab"], &mut old_tool_strings);
+    // прежняя вкладка - одна строка `  "tab": {...},`
+    if let Some(s) = text.find("\n  \"tab\": ") {
+        let e = text[s + 1..].find('\n').map_or(text.len(), |e| s + 1 + e);
+        text.replace_range(s..e, "");
+    }
     if let Some(s) = text.find("\n  \"tools\": [") {
         let e = text[s..]
             .find("\n  ],")
@@ -361,7 +586,10 @@ pub fn splice(text: &str, tools: &[J], ru: &Map<String, J>) -> Result<String, St
         text.replace_range(s..e, "");
     }
     let lines: Vec<String> = tools.iter().map(|t| format!("    {t}")).collect();
-    let block = format!("\n  \"tools\": [\n{}\n  ],", lines.join(",\n"));
+    let mut block = format!("\n  \"tools\": [\n{}\n  ],", lines.join(",\n"));
+    if let Some(tab) = tab {
+        block.insert_str(0, &format!("\n  \"tab\": {tab},"));
+    }
     let at = text
         .find("\n  \"i18n\": {")
         .ok_or("plugin.json: no i18n section")?;
@@ -372,7 +600,7 @@ pub fn splice(text: &str, tools: &[J], ru: &Map<String, J>) -> Result<String, St
     let mut other = std::collections::HashSet::new();
     if let Some(o) = m.as_object() {
         for (k, v) in o {
-            if k != "tools" && k != "i18n" {
+            if k != "tools" && k != "tab" && k != "i18n" {
                 strings(v, &mut other);
             }
         }
@@ -533,6 +761,91 @@ mod tests {
         let p = crate::tool::prepare(&cat, &opts, &store, &req, Lang::Ru)
             .unwrap_or_else(|e| unreachable!("{e}"));
         assert_eq!(p.values["GROUP"], json!(["a", "b", "c"]));
+    }
+
+    /// Своя вкладка: инструменты в меню, команды кнопками, переводы, пределы
+    /// RustGIS, вставка в манифест и замена прежней.
+    #[test]
+    fn own_tab() {
+        let cat = Catalog::parse(
+            r#"{"tools": [{"code": "9.01", "name": "hello_tool", "title": {"ru": "Привет", "en": "Hello"},
+            "params": [{"key": "INPUT", "kind": "lines", "label": {"ru": "Линии", "en": "Lines"}}]}]}"#,
+        )
+        .unwrap_or_else(|e| unreachable!("{e}"));
+        let opts = Options {
+            toolbox: "T",
+            offered: &["hello_tool"],
+            xy_tables: &[],
+        };
+        static MENU: Menu = Menu {
+            label: Label {
+                en: "Lines",
+                ru: "Линии",
+            },
+            icon: Some("line_layer"),
+            help: None,
+            layout: None,
+            items: &[Item::Tool("hello_tool")],
+        };
+        static TAB: Tab = Tab {
+            label: Label {
+                en: "Hello",
+                ru: "Привет",
+            },
+            groups: &[
+                Group {
+                    label: Label {
+                        en: "Window",
+                        ru: "Окно",
+                    },
+                    layout: Layout::Large,
+                    items: &[Item::Command("about")],
+                },
+                Group {
+                    label: Label {
+                        en: "Tools",
+                        ru: "Инструменты",
+                    },
+                    layout: Layout::Small,
+                    items: &[Item::Menu(&MENU)],
+                },
+            ],
+        };
+        let (tab, ru) =
+            tab_section(&TAB, &cat, &opts, &["about"]).unwrap_or_else(|e| unreachable!("{e}"));
+        assert_eq!(tab["groups"][0]["items"][0], "about");
+        assert_eq!(tab["groups"][1]["layout"], "small");
+        assert_eq!(tab["groups"][1]["items"][0]["menu"], "Lines");
+        assert_eq!(tab["groups"][1]["items"][0]["items"][0], "tool:hello-tool");
+        assert_eq!(ru["Tools"], "Инструменты");
+        // ошибки: чужая команда, занятое имя вкладки
+        assert!(tab_section(&TAB, &cat, &opts, &[]).is_err());
+        static HOME: Tab = Tab {
+            label: Label {
+                en: "Home",
+                ru: "Главная",
+            },
+            groups: &[],
+        };
+        assert!(tab_section(&HOME, &cat, &opts, &["about"]).is_err());
+        // вставка, повтор без изменений, замена и снятие
+        let manifest = "{\n  \"id\": \"hello\",\n  \"commands\": [],\n  \"i18n\": {\n    \"ru\": {\n      \"x\": \"y\"\n    }\n  }\n}\n";
+        let (tools, mut all) = tools_section(&cat, &opts);
+        all.extend(ru);
+        let one = splice_all(manifest, &tools, Some(&tab), &all).unwrap_or_default();
+        let m: J = serde_json::from_str(&one).unwrap_or(J::Null);
+        assert_eq!(m["tab"], tab);
+        assert_eq!(m["i18n"]["ru"]["Window"], "Окно");
+        assert_eq!(
+            splice_all(&one, &tools, Some(&tab), &all).unwrap_or_default(),
+            one
+        );
+        let (_, plain) = tools_section(&cat, &opts);
+        let gone = splice_all(&one, &tools, None, &plain).unwrap_or_default();
+        let m: J = serde_json::from_str(&gone).unwrap_or(J::Null);
+        assert!(m.get("tab").is_none());
+        assert!(m["i18n"]["ru"].get("Window").is_none(), "{gone}");
+        assert_eq!(m["i18n"]["ru"]["x"], "y");
     }
 
     /// Справка в HTML (Topoliner): теги сняты, заголовок пропущен.
