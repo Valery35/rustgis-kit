@@ -465,7 +465,18 @@ pub fn finish(
                     .and_then(|id| src.get(&id))
                     .is_some_and(geom::has_z)
             });
-        let solid = src_z || matches!(kind, "mesh" | "line" | "point");
+        // свой итог - только если у него есть высота: точки и линии без Z
+        // слой RustGIS держит и так
+        let own_z = matches!(kind, "mesh" | "line" | "point")
+            && feats.iter().any(|f| {
+                let g = &f["geometry"];
+                geom::z_range(g).is_some()
+                    || g["xyz"]
+                        .get(2)
+                        .and_then(J::as_f64)
+                        .is_some_and(f64::is_finite)
+            });
+        let solid = src_z || own_z;
         if solid && let Frame::Utm(u) = &p.frame {
             let g3: Vec<J> = feats
                 .iter()
@@ -564,6 +575,16 @@ mod tests {
         let p2 =
             prepare(&cat, &OPTS, &store, &req, Lang::En).unwrap_or_else(|e| unreachable!("{e}"));
         assert_eq!(p2.values["INPUT"][0]["parts"][0][0], json!([x0, y0, 2.5]));
+        // точки и линии без Z - в проект, мимо хранилища и окна
+        let flat = json!({"OUTPUT": {"geometry": "point", "fields": [], "features": [
+            {"source": 0, "values": [], "geometry": {"xyz": [x0, y0, null]}}]}});
+        let store2 = Store::new(crate::store::temp_home("rustgis-kit-tool").join("flat"));
+        let done = finish(&p, &flat, Vec::new(), &store2, Lang::Ru);
+        assert!(done.solids.is_empty() && !store2.has("Сдвинутые"));
+        assert_eq!(
+            done.reply["ok"]["layers"][0]["geojson"]["features"][0]["geometry"]["type"],
+            "Point"
+        );
         // чужой инструмент и не тот вид значения - ошибки
         let r = json!({"id": "nope"});
         assert_eq!(
