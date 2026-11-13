@@ -98,6 +98,37 @@ UTM по середине входа или метры системы табли
    `manifest::tools_section_hiding` (с 0.1.4) - пары (инструмент, ключ),
    `*` вместо инструмента - у всех. Скрытое поле в запрос не приходит,
    расчёт берёт его умолчание из `tools.json`.
+
+   Своя вкладка ленты вместо группы на вкладке «Плагины» (с 0.1.9) -
+   `manifest::Tab` с группами, командами, инструментами и выпадающими
+   меню, `manifest::tab_section` проверяет пределы RustGIS и даёт русские
+   строки, `manifest::splice_all` вставляет вкладку вместе с разделом
+   `tools`. У инструмента в RustGIS значка нет (рисуется сундук), поэтому
+   инструменты удобнее держать в меню со значком. Значки - имена из
+   `ALL` в `crates/ui-egui/src/icons.rs` RustGIS (`globe_view`, `about`,
+   `table`, `line_layer`...), чужое имя рисуется пустым квадратом.
+   Меню и мелкие кнопки работают с RustGIS 0.5.0.
+
+   ```rust
+   use rustgis_kit::manifest::{Group, Item, Label, Layout, Menu, Tab};
+
+   static BODIES: Menu = Menu {
+       label: Label { en: "Bodies", ru: "Тела" },
+       icon: Some("polygon_tool"),
+       help: None,
+       layout: None,
+       items: &[Item::Tool("sweep_body"), Item::Tool("contour_crown")],
+   };
+   static TAB: Tab = Tab {
+       label: Label { en: "Isoliner3D", ru: "Isoliner3D" },
+       groups: &[
+           Group { label: Label { en: "Scene", ru: "Сцена" }, layout: Layout::Large,
+                   items: &[Item::Command("scene"), Item::Command("about")] },
+           Group { label: Label { en: "Tools", ru: "Инструменты" }, layout: Layout::Large,
+                   items: &[Item::Menu(&BODIES)] },
+       ],
+   };
+   ```
 6. Упаковать.
 
    ```powershell
