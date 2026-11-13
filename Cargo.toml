@@ -1,0 +1,31 @@
+# rustgis-kit - общая основа расширений RustGIS линейки Информ++.
+# Copyright (C) 2026 ООО «Информ++». Лицензия Apache 2.0.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "rustgis-kit"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+authors = ["ООО «Информ++»"]
+description = "Общая основа расширений-процессов RustGIS: протокол, инструменты по tools.json, системы координат, итоги слоями, упаковка"
+publish = false
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# пример минимального расширения: его тест идёт с cargo test
+[[example]]
+name = "minimal"
+test = true
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
