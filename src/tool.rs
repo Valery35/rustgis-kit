@@ -72,6 +72,9 @@ pub struct Prepared<'a> {
     /// Зона UTM входа.
     pub utm: Utm,
     sources: Sources,
+    /// Поля объектов входов (properties) по ключу поля-слоя и номеру: с них
+    /// начинается выход с `keep_source`.
+    source_props: Sources,
 }
 
 /// Номер объекта: `row` RustGIS, иначе `id`, иначе порядковый.
@@ -244,7 +247,10 @@ enum Bad {
     NoBodies(String),
 }
 
-fn values(tool: &Tool, req: &J, store: &Store) -> Result<(J, Utm, Sources), Bad> {
+/// Значения прогона, зона, геометрии и поля объектов входов.
+type Parsed = (J, Utm, Sources, Sources);
+
+fn values(tool: &Tool, req: &J, store: &Store) -> Result<Parsed, Bad> {
     let params = &req["params"];
     let layers = &req["layers"];
     let mut inputs: Vec<(&Param, J)> = Vec::new();
@@ -262,15 +268,19 @@ fn values(tool: &Tool, req: &J, store: &Store) -> Result<(J, Utm, Sources), Bad>
     let utm = zone_of(&inputs.iter().map(|(_, fc)| fc).collect::<Vec<_>>());
     let mut out = serde_json::Map::new();
     let mut sources: Sources = HashMap::new();
+    let mut source_props: Sources = HashMap::new();
     for (p, fc) in &inputs {
         let name = params[p.rg_name()].as_str().unwrap_or("");
         out.insert(format!("@{}", p.key), layer_info(name, fc));
         out.insert(p.key.clone(), layer_value(p, fc, &utm));
         let by_id = sources.entry(p.key.clone()).or_default();
+        let props_by_id = source_props.entry(p.key.clone()).or_default();
         for (i, f) in fc["features"].as_array().into_iter().flatten().enumerate() {
-            by_id
-                .entry(feature_id(f, i))
-                .or_insert_with(|| f["geometry"].clone());
+            let id = feature_id(f, i);
+            by_id.entry(id).or_insert_with(|| f["geometry"].clone());
+            props_by_id
+                .entry(id)
+                .or_insert_with(|| f["properties"].clone());
         }
     }
     for p in &tool.params {
@@ -302,7 +312,7 @@ fn values(tool: &Tool, req: &J, store: &Store) -> Result<(J, Utm, Sources), Bad>
         };
         out.insert(p.key.clone(), got);
     }
-    Ok((J::Object(out), utm, sources))
+    Ok((J::Object(out), utm, sources, source_props))
 }
 
 /// Запрос RustGIS - в значения прогона. Ошибка - готовый ответ
@@ -319,7 +329,7 @@ pub fn prepare<'a>(
         .by_rg_id(id)
         .filter(|t| opts.offered.contains(&t.name.as_str()))
         .ok_or_else(|| json!({"error": tr(lang, "Инструмента «%s» нет.", &[id.to_string()])}))?;
-    let (values, utm, sources) = values(tool, req, store).map_err(|b| match b {
+    let (values, utm, sources, source_props) = values(tool, req, store).map_err(|b| match b {
         Bad::NoBodies(layer) => json!({"error": tr(
             lang,
             "Слой «%s» без тел с высотой. Слой RustGIS высоты не хранит, тела дают итоги инструментов расширения.",
@@ -351,6 +361,7 @@ pub fn prepare<'a>(
         frame,
         utm,
         sources,
+        source_props,
     })
 }
 
@@ -437,10 +448,23 @@ pub fn finish(
                     .to_string()
             })
             .collect();
+        // keep_source модуля: выход начинается полями объекта источника,
+        // кроме выхода, заменяющего поля (у него полный набор в named)
+        let keep_props = o["keep_source"]
+            .as_str()
+            .filter(|_| !o["replace"].as_bool().unwrap_or(false))
+            .and_then(|k| p.source_props.get(k));
         let features: Vec<J> = feats
             .iter()
             .map(|f| {
                 let mut props = serde_json::Map::new();
+                if let (Some(by_id), Some(id)) = (keep_props, f["source"].as_i64())
+                    && let Some(src) = by_id.get(&id).and_then(J::as_object)
+                {
+                    for (k, v) in src {
+                        props.insert(k.clone(), v.clone());
+                    }
+                }
                 match &f["values"] {
                     // выход, заменяющий поля источника, - значения по имени
                     J::Object(m) => {
@@ -590,6 +614,21 @@ mod tests {
         let p2 =
             prepare(&cat, &OPTS, &store, &req, Lang::En).unwrap_or_else(|e| unreachable!("{e}"));
         assert_eq!(p2.values["INPUT"][0]["parts"][0][0], json!([x0, y0, 2.5]));
+        // keep_source - поля объекта источника и поверх них свои, replace -
+        // только свои
+        let kept = json!({"OUTPUT": {"geometry": "source", "keep_source": "INPUT",
+            "fields": [{"name": "dz", "type": "double"}],
+            "features": [{"source": 0, "values": [1.0], "geometry": {"source": 0}}]}});
+        let store3 = Store::new(crate::store::temp_home("rustgis-kit-tool").join("kept"));
+        let done = finish(&p, &kept, Vec::new(), &store3, Lang::Ru);
+        let props = &done.reply["ok"]["layers"][0]["geojson"]["features"][0]["properties"];
+        assert_eq!(props["name"], "a");
+        assert_eq!(props["dz"], 1.0);
+        let mut replaced = kept.clone();
+        replaced["OUTPUT"]["replace"] = json!(true);
+        let done = finish(&p, &replaced, Vec::new(), &store3, Lang::Ru);
+        let props = &done.reply["ok"]["layers"][0]["geojson"]["features"][0]["properties"];
+        assert!(props.get("name").is_none());
         // точки и линии без Z - в проект, мимо хранилища и окна
         let flat = json!({"OUTPUT": {"geometry": "point", "fields": [], "features": [
             {"source": 0, "values": [], "geometry": {"xyz": [x0, y0, null]}}]}});
