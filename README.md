@@ -250,6 +250,23 @@ cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --target x86_64-unknown-linux-gnu -- -D warnings
 ```
 
+## Что ждут продукты
+
+Нужды Isoliner от 13 ноября 2026 года (разведка модуля Isoliner,
+`isoliner-qgis_rust-port-survey.md` в общей папке заметок).
+
+1. Вид поля «охват» (демо-инструменты Isoliner, 1.09). Не решено, чем
+   его задавать в окне RustGIS - слоем, по охвату которого строить, или
+   числами центра и размера. Сначала вид поля появляется в `toolspec.py`
+   модуля, потом здесь (`catalog`, `manifest::rg_kind`, `tool::prepare`).
+2. Выход таблицей без геометрии (вариограмма 1.06). Крейт уже отдаёт
+   выход `"geometry": "none"` в `tables` ответа. Принимает ли его RustGIS
+   в проект, проверить `rustgis-cli run --plugin` до первого такого
+   инструмента.
+3. Член `crs` с локальной инженерной системой «расстояние - высота» для
+   чертежей разреза (группа 4). Сейчас `crs` - только код EPSG
+   (`geo::epsg`), локальной системы RustGIS может не знать, нужна проверка.
+
 ## Кто пользуется
 
 Isoliner3D для RustGIS (`isoliner-scene`, `apps/isoliner-rustgis`) -
