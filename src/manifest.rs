@@ -172,6 +172,27 @@ pub fn fits(t: &crate::catalog::Tool) -> bool {
 /// Раздел `tools` манифеста и русские строки к нему (английский ключ -
 /// русский перевод).
 pub fn tools_section(catalog: &Catalog, opts: &Options) -> (Vec<J>, Map<String, J>) {
+    tools_section_hiding(catalog, opts, &[])
+}
+
+/// Скрыто ли поле `key` инструмента `tool`: пара (инструмент, ключ),
+/// инструмент `*` - у всех.
+pub fn is_hidden(hidden: &[(&str, &str)], tool: &str, key: &str) -> bool {
+    hidden
+        .iter()
+        .any(|(t, k)| (*t == tool || *t == "*") && *k == key)
+}
+
+/// [`tools_section`] без полей `hidden`: пары (инструмент Processing,
+/// ключ поля), `*` вместо инструмента - у всех. Поля, бесполезные
+/// в RustGIS (M у слоёв без M), в окно не идут, расчёт берёт их умолчание
+/// из `tools.json`. Обязательное поле без умолчания скрыть нельзя - оно
+/// остаётся в окне.
+pub fn tools_section_hiding(
+    catalog: &Catalog,
+    opts: &Options,
+    hidden: &[(&str, &str)],
+) -> (Vec<J>, Map<String, J>) {
     let mut ru = Map::new();
     let mut say = |en: &str, r: &str| {
         if !en.is_empty() && en != r {
@@ -192,6 +213,10 @@ pub fn tools_section(catalog: &Catalog, opts: &Options) -> (Vec<J>, Map<String, 
         let mut params = Vec::new();
         for p in &t.params {
             let Some(kind) = rg_kind(p) else { continue };
+            let can_hide = p.optional || p.default.as_ref().is_some_and(|d| !d.is_null());
+            if can_hide && is_hidden(hidden, &t.name, &p.key) {
+                continue;
+            }
             let label = plain_text(p.label.get(Lang::En));
             say(&label, &plain_text(p.label.get(Lang::Ru)));
             let mut o = json!({"name": p.rg_name(), "label": label, "kind": kind});
@@ -340,6 +365,20 @@ mod tests {
         // повторная вставка заменяет раздел, а не дублирует
         let again = splice(&out, &tools, &ru).unwrap_or_default();
         assert_eq!(again.matches("\"tools\"").count(), 1);
+        // скрытое поле с умолчанием уходит из окна, обязательный слой - нет
+        let (hid, _) = tools_section_hiding(
+            &cat,
+            &opts,
+            &[("hello_tool", "MODE"), ("*", "INPUT"), ("other", "X")],
+        );
+        let names: Vec<&str> = hid[0]["params"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|p| p["name"].as_str())
+            .collect();
+        assert_eq!(names, ["input"]);
+        assert!(is_hidden(&[("*", "USE_M")], "any", "USE_M"));
     }
 
     /// Справка в HTML (Topoliner): теги сняты, заголовок пропущен.
