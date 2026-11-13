@@ -229,10 +229,9 @@ pub fn tools_section_hiding(
             }
             let hint = plain_text(p.hint.get(Lang::En));
             let hint_ru = plain_text(p.hint.get(Lang::Ru));
-            if !hint.is_empty() {
-                o["help"] = json!(hint);
-                say(&hint, &hint_ru);
-            }
+            // подсказка в окне и её перевод - одна пара, без лишних строк
+            let mut help: Option<(String, String)> =
+                (!hint.is_empty()).then(|| (hint.clone(), hint_ru.clone()));
             if p.kind == "enum" && p.multiple {
                 // пункты через запятую, их перечень - в подсказке
                 let ix: Vec<usize> = match &p.default {
@@ -258,8 +257,7 @@ pub fn tools_section_hiding(
                 };
                 let help_en = format!("{} Comma-separated, from {}.", hint, all(Lang::En));
                 let help_ru = format!("{} Через запятую, из списка {}.", hint_ru, all(Lang::Ru));
-                say(&help_en, &help_ru);
-                o["help"] = json!(help_en);
+                help = Some((help_en, help_ru));
                 let d = pick(Lang::En);
                 if !d.is_empty() {
                     o["default"] = json!(d);
@@ -279,10 +277,7 @@ pub fn tools_section_hiding(
                         format!("{a} {b}")
                     }
                 };
-                let help_en = join(&hint, tail(Lang::En));
-                let help_ru = join(&hint_ru, tail(Lang::Ru));
-                say(&help_en, &help_ru);
-                o["help"] = json!(help_en);
+                help = Some((join(&hint, tail(Lang::En)), join(&hint_ru, tail(Lang::Ru))));
                 let d = match &p.default {
                     Some(J::Array(a)) => a
                         .iter()
@@ -311,6 +306,10 @@ pub fn tools_section_hiding(
                 .filter(|d| !d.is_null() && d.as_str() != Some("") && !p.is_layer())
             {
                 o["default"] = d.clone();
+            }
+            if let Some((en, r)) = help {
+                say(&en, &r);
+                o["help"] = json!(en);
             }
             params.push(o);
         }
@@ -525,6 +524,8 @@ mod tests {
             ru["Grouping fields. Field names of the layer, comma-separated."],
             "Поля группировки. Имена полей слоя через запятую."
         );
+        // подсказка без приписки в переводы не идёт - её нет в окне
+        assert!(ru.get("Grouping fields.").is_none());
         let store = crate::store::Store::new(crate::store::temp_home("rustgis-kit-mf"));
         let fc = json!({"type": "FeatureCollection", "features": [{"type": "Feature",
             "properties": {"a": 1}, "geometry": {"type": "LineString", "coordinates": [[56.0, 54.7], [56.001, 54.7]]}}]});
