@@ -51,15 +51,25 @@ pub trait Product {
     }
     /// Событие сессии RustGIS (`layers`, `view`, `selection`, `project`).
     fn event(&self, _host: &mut dyn Call, _name: &str) {}
+    /// Своя система итога инструмента, код EPSG (с 0.1.12). Some - итог
+    /// считается и уходит в метрах этой системы с членом `crs`, а не
+    /// в зоне UTM по середине входа. Нужно инструменту без слоёв на входе
+    /// (пример данных), у которого зону не по чему выбрать.
+    fn native_frame(&self, _tool: &Tool) -> Option<String> {
+        None
+    }
 }
 
 /// Инструмент RustGIS: разбор, расчёт продукта, ответ.
 pub fn run_tool(product: &dyn Product, req: &J, lang: Lang) -> J {
     let store = product.store();
-    let p = match prepare(product.catalog(), product.options(), &store, req, lang) {
+    let mut p = match prepare(product.catalog(), product.options(), &store, req, lang) {
         Ok(p) => p,
         Err(e) => return e,
     };
+    if let Some(code) = product.native_frame(p.tool) {
+        p.frame = crate::geom::Frame::Native(code);
+    }
     let (outputs, messages) = match product.compute(p.tool, &p.values, lang) {
         Ok(r) => r,
         Err(Failure::Values(why)) => {
@@ -149,4 +159,73 @@ pub fn serve_stdio(product: &dyn Product) -> std::process::ExitCode {
 /// Ответ «команды нет» на языке показа.
 pub fn no_command(id: &str, lang: Lang) -> J {
     json!({"error": tr(lang, "Команды «%s» нет.", &[id.to_string()])})
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Продукт с одним инструментом без слоёв: пример в метрах EPSG:32640.
+    struct Demo {
+        catalog: Catalog,
+        frame: Option<String>,
+    }
+
+    const OPTS: Options = Options {
+        toolbox: "T",
+        offered: &["demo"],
+        xy_tables: &[],
+    };
+
+    impl Product for Demo {
+        fn catalog(&self) -> &Catalog {
+            &self.catalog
+        }
+        fn options(&self) -> &Options {
+            &OPTS
+        }
+        fn store(&self) -> Store {
+            Store::new(crate::store::temp_home("rustgis-kit-runner").join("bodies"))
+        }
+        fn compute(&self, _t: &Tool, _v: &J, _l: Lang) -> Result<(J, Vec<String>), Failure> {
+            Ok((
+                json!({"OUTPUT": {"geometry": "point", "fields": [],
+                    "features": [{"values": [], "geometry": {"xyz": [500_000.0, 6_000_000.0, null]}}]}}),
+                Vec::new(),
+            ))
+        }
+        fn command(&self, _h: &mut dyn Call, req: &J, lang: Lang) -> J {
+            no_command(req["id"].as_str().unwrap_or(""), lang)
+        }
+        fn native_frame(&self, _tool: &Tool) -> Option<String> {
+            self.frame.clone()
+        }
+    }
+
+    /// Инструмент без слоёв со своей системой: итог в её метрах с членом
+    /// crs, а не в градусах зоны UTM 31N (зона пустого входа).
+    #[test]
+    fn a_tool_without_layers_in_its_own_system() {
+        let catalog = Catalog::parse(
+            r#"{"tools": [{"code": "1.01", "name": "demo",
+            "params": [{"key": "OUTPUT", "kind": "sink"}]}]}"#,
+        )
+        .unwrap_or_else(|e| unreachable!("{e}"));
+        let req = json!({"kind": "tool", "id": "demo", "params": {}, "layers": {}});
+        let p = Demo {
+            catalog,
+            frame: Some("EPSG:32640".into()),
+        };
+        let r = run_tool(&p, &req, Lang::En);
+        let fc = &r["ok"]["layers"][0]["geojson"];
+        assert_eq!(fc["crs"]["properties"]["name"], "EPSG:32640", "{r}");
+        assert_eq!(
+            fc["features"][0]["geometry"]["coordinates"],
+            json!([500_000.0, 6_000_000.0])
+        );
+        // без своей системы - градусы зоны пустого входа, как раньше
+        let p = Demo { frame: None, ..p };
+        let r = run_tool(&p, &req, Lang::En);
+        assert!(r["ok"]["layers"][0]["geojson"].get("crs").is_none());
+    }
 }

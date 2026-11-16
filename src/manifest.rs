@@ -54,6 +54,8 @@ pub fn rg_kind(p: &Param) -> Option<&'static str> {
         "bool" => "bool",
         "sink" if p.optional => "bool",
         "string" => "text",
+        // путь к файлу: RustGIS 0.7.0 отдаёт процессу путь, а не содержимое
+        "file" => "file",
         _ => return None,
     })
 }
@@ -224,8 +226,15 @@ pub fn tools_section_hiding(
             let label = plain_text(p.label.get(Lang::En));
             say(&label, &plain_text(p.label.get(Lang::Ru)));
             let mut o = json!({"name": p.rg_name(), "label": label, "kind": kind});
-            if p.is_layer() && !p.optional {
+            if (p.is_layer() || p.kind == "file") && !p.optional {
                 o["required"] = json!(true);
+            }
+            if p.kind == "file" {
+                // путь, а не содержимое: без предела в 64 МБ (RustGIS 0.7.0)
+                o["mode"] = json!("path");
+                if !p.extensions.is_empty() {
+                    o["extensions"] = json!(p.extensions);
+                }
             }
             let hint = plain_text(p.hint.get(Lang::En));
             let hint_ru = plain_text(p.hint.get(Lang::Ru));
@@ -736,6 +745,35 @@ mod tests {
             .collect();
         assert_eq!(names, ["input"]);
         assert!(is_hidden(&[("*", "USE_M")], "any", "USE_M"));
+    }
+
+    /// Поле-файл: в окне RustGIS - выбор файла с путём (mode path), в
+    /// значениях - путь как есть.
+    #[test]
+    fn file_parameter() {
+        let cat = Catalog::parse(
+            r#"{"tools": [{"code": "1.01", "name": "demo", "title": {"ru": "Пример", "en": "Demo"},
+            "params": [{"key": "SOURCE", "kind": "file", "extensions": ["gpkg"],
+                        "label": {"ru": "Файл", "en": "File"}}]}]}"#,
+        )
+        .unwrap_or_else(|e| unreachable!("{e}"));
+        let opts = Options {
+            toolbox: "T",
+            offered: &["demo"],
+            xy_tables: &[],
+        };
+        assert!(fits(&cat.tools[0]));
+        let (tools, _) = tools_section(&cat, &opts);
+        let f = &tools[0]["params"][0];
+        assert_eq!(f["kind"], "file");
+        assert_eq!(f["mode"], "path");
+        assert_eq!(f["extensions"], json!(["gpkg"]));
+        assert_eq!(f["required"], true);
+        let store = crate::store::Store::new(crate::store::temp_home("rustgis-kit-file"));
+        let req = json!({"id": "demo", "params": {"source": "C:/data/routes.gpkg"}, "layers": {}});
+        let p = crate::tool::prepare(&cat, &opts, &store, &req, Lang::Ru)
+            .unwrap_or_else(|e| unreachable!("{e}"));
+        assert_eq!(p.values["SOURCE"], "C:/data/routes.gpkg");
     }
 
     /// Несколько полей: в окне текст через запятую, в значениях - список.

@@ -53,7 +53,8 @@ impl Text {
 
 /// Поле инструмента. `kind` - вид поля модуля: `lines`, `points`,
 /// `features`, `table`, `mesh`, `meshes`, `raster`, `band`, `field`,
-/// `string`, `bool`, `number`, `integer`, `enum`, `sink`.
+/// `string`, `bool`, `number`, `integer`, `enum`, `sink`, `file` (путь
+/// к файлу, с 0.1.12).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 pub struct Param {
     pub key: String,
@@ -78,6 +79,9 @@ pub struct Param {
     pub numeric: bool,
     #[serde(default)]
     pub multiple: bool,
+    /// Расширения файла для поля `file` (без точки), пусто - любой файл.
+    #[serde(default)]
+    pub extensions: Vec<String>,
 }
 
 impl Param {
