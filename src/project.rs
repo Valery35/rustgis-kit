@@ -10,8 +10,9 @@
 //! RustGIS (`host.view`, `"EPSG:n"`), иначе None - зона UTM по середине
 //! слоёв. Проекции карты `mercator` и `globe` - не система для метров.
 //!
-//! Слои в систему переводит сам RustGIS: `share.exportLayer` с `crs`
-//! пишет Shapefile ([`crate::shp`]). Система в градусах, итог с высотой
+//! Слои в систему переводит сам RustGIS: `host.features` с `crs`
+//! (RustGIS 0.7.0), у прежних - `share.exportLayer` с `crs` пишет
+//! Shapefile ([`crate::shp`]). Система в градусах, итог с высотой
 //! в слоях или неудачная выгрузка - слои в градусах `host.features`,
 //! продукт переводит их через зону UTM ([`crate::geo`]).
 
@@ -54,8 +55,32 @@ pub fn degrees(fc: &J) -> bool {
     any && all
 }
 
+/// Слои `ids` в метрах системы `target` прямо от RustGIS: `host.features`
+/// с `crs` (RustGIS 0.7.0, #1942). None - система в градусах, RustGIS
+/// такого не умеет (ответ без члена `crs`) или отказал.
+pub fn features_in(
+    host: &mut dyn Call,
+    ids: &[(i64, String)],
+    target: &str,
+) -> Option<Vec<(String, J)>> {
+    let mut out = Vec::new();
+    for (id, name) in ids {
+        let fc = host
+            .call("host.features", json!({"layer": id, "crs": target}))
+            .ok()?;
+        // старый RustGIS crs не знает и отвечает градусами без члена crs
+        fc.get("crs")?;
+        if out.is_empty() && degrees(&fc) {
+            return None;
+        }
+        out.push((name.clone(), fc));
+    }
+    Some(out)
+}
+
 /// Слои `ids` в метрах системы `target` выгрузкой RustGIS в папку `dir`.
-/// None - система в градусах или выгрузка не удалась.
+/// None - система в градусах или выгрузка не удалась. Запасной путь для
+/// RustGIS до 0.7.0, у которого `host.features` не берёт `crs`.
 pub fn export_layers(
     host: &mut dyn Call,
     ids: &[(i64, String)],
@@ -121,7 +146,8 @@ pub fn project_layers(
         scene_crs(host, chosen)
     };
     if let Some(target) = target
-        && let Some(list) = export_layers(host, &ids, &target, export_dir)
+        && let Some(list) = features_in(host, &ids, &target)
+            .or_else(|| export_layers(host, &ids, &target, export_dir))
     {
         return Ok(Layers {
             list,
@@ -183,6 +209,42 @@ mod tests {
             scene_crs(&mut s, &dir.join("pick.crs")).as_deref(),
             Some("EPSG:28410")
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Карта в метрах EPSG: RustGIS 0.7.0 отдаёт слой сразу в этой системе
+    /// (`host.features` с `crs`), выгрузки нет. Старый RustGIS отвечает без
+    /// члена `crs` - тогда выгрузка, а не выгрузилось - градусы.
+    #[test]
+    fn layers_in_the_map_system() {
+        let deg = json!({"type": "FeatureCollection", "features": [
+            {"type": "Feature", "geometry": {"type": "Point", "coordinates": [56.0, 54.7]}}]});
+        let metres = json!({"type": "FeatureCollection",
+            "crs": {"type": "name", "properties": {"name": "EPSG:28410"}},
+            "features": [{"type": "Feature", "geometry": {"type": "Point", "coordinates": [10_571_666.0, 6_061_000.0]}}]});
+        let dir = crate::store::temp_home("rustgis-kit-project-crs");
+        let store = Store::new(dir.join("bodies"));
+        let layers = json!([{"id": 1, "name": "a", "visible": true}]);
+        let view = json!({"projection": "EPSG:28410"});
+        let mut s = Script(
+            vec![layers.clone(), deg.clone(), view.clone(), metres.clone()],
+            Vec::new(),
+        );
+        let l = project_layers(&mut s, &store, &dir.join("none.crs"), &dir.join("export"))
+            .unwrap_or_else(|e| unreachable!("{e}"));
+        assert_eq!(l.crs.as_deref(), Some("EPSG:28410"));
+        assert_eq!(l.list, vec![("a".to_string(), metres)]);
+        assert_eq!(
+            s.1,
+            ["host.layers", "host.features", "host.view", "host.features"]
+        );
+        // старый RustGIS: ответ без crs - выгрузка, она не удалась - градусы
+        let mut s = Script(vec![layers, deg.clone(), view, deg.clone()], Vec::new());
+        let l = project_layers(&mut s, &store, &dir.join("none.crs"), &dir.join("export"))
+            .unwrap_or_else(|e| unreachable!("{e}"));
+        assert_eq!(l.crs, None);
+        assert_eq!(l.list, vec![("a".to_string(), deg)]);
+        assert_eq!(s.1.last().map(String::as_str), Some("share.exportLayer"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

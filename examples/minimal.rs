@@ -51,7 +51,7 @@ const MANIFEST: &str = r#"{
   "runtime": "process",
   "session": true,
   "run": { "windows": ["bin/minimal.exe", "rustgis-plugin"] },
-  "minRustgisVersion": "0.6.0",
+  "minRustgisVersion": "0.7.0",
   "commands": [
     { "id": "about", "label": "About", "help": "About the extension." }
   ],
